@@ -29,6 +29,8 @@
 /// picks it up for modules with arch {12, 5, 0}.
 
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 #include <utility>
 
 #include "stinkytofu/analysis/AnalysisRegistration.hpp"
@@ -76,6 +78,16 @@
 #include "stinkytofu/transforms/asm/dag/SchedulingKnobHeuristics.hpp"
 
 namespace stinkytofu {
+
+namespace {
+/// STINKYTOFU_KEEP_AUTHORED=nop,mov,reuse,prologue : leave that part of the producer's code alone.
+bool keepAuthored(const char* what) {
+    const char* env = std::getenv("STINKYTOFU_KEEP_AUTHORED");
+    if (env == nullptr) return false;
+    const std::string list = std::string(",") + env + ",";
+    return list.find(std::string(",") + what + ",") != std::string::npos;
+}
+}  // namespace
 namespace {
 // Deliberately a literal triple rather than getArchTriple(GfxArchID::Gfx1250):
 // this file is compiled into every build, including a Gfx1250v0-only one where
@@ -151,7 +163,7 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
     // Region scheduling + kernel setup (entry only).
     {
         PassManager pm = makeEntryPM(module, debugStreams);
-        pm.addPass(createStinkyRemoveNopPass(/*vNopOnly=*/true));
+        if (!keepAuthored("nop")) pm.addPass(createStinkyRemoveNopPass(/*vNopOnly=*/true));
         PB.applyExtensionPoint(PipelineExtensionPoint::BeforeRegionPasses, pm, module);
 
         // -- region: loopWithPrefetch + noLoadLoopBody --
@@ -303,7 +315,8 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
         mpm.addPass(createMainOnlyAdaptor(std::move(pm)));
     }
 
-    mpm.addPass(createFunctionToModuleAdaptor(createAsmMovePropagationPass()));
+    if (!keepAuthored("mov"))
+        mpm.addPass(createFunctionToModuleAdaptor(createAsmMovePropagationPass()));
 
     // MSB is materialized for the entry function and every callable function
     // (each function owns its VGPR MSB hardware state).
@@ -339,7 +352,8 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
     // Whole-kernel reuse on final instruction order (O0 and O1+; after scheduler
     // + VGPR MSB). Per function, each in isolation (reuse never chains across a
     // call site or a function boundary).
-    mpm.addPass(createFunctionToModuleAdaptor(createSetMatrixReusePass()));
+    if (!keepAuthored("reuse"))
+        mpm.addPass(createFunctionToModuleAdaptor(createSetMatrixReusePass()));
 
     // Run after the final CFG build but before flatten/SW-prefetch: this pass
     // covers final per-function code, while SW-prefetch owns its hints' XCnt
@@ -373,7 +387,8 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
         // Runs after flatten, so the entry's first instruction really is the
         // kernel's, and before SW prefetch, so that pass lays out its bytes over the
         // final entry and its CP-boundary coverage stays gap-free.
-        pm.addPass(createInsertInitialUnclausedVmemPass(moduleOptions.sgprsCompacted()));
+        if (!keepAuthored("prologue"))
+            pm.addPass(createInsertInitialUnclausedVmemPass(moduleOptions.sgprsCompacted()));
 
         // SW instruction prefetch — abs and PC-rel are mutually exclusive.
         // Priority: abs (EnableSwInstructionPrefetchAbs) > PC-rel

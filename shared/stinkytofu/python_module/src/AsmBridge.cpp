@@ -12,17 +12,26 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <array>
+
 #include "stinkytofu/analysis/asm/AsmVerifierPass.hpp"
+#include "stinkytofu/bindings/python/Module.hpp"
+#include "stinkytofu/pipeline/BackendRegistry.hpp"
 #include "stinkytofu/core/Function.hpp"
 #include "stinkytofu/hardware/ArchHelper.hpp"
 #include "stinkytofu/hardware/HwReg.hpp"
 #include "stinkytofu/ir/asm/StinkyAsmDirectives.hpp"
 #include "stinkytofu/ir/asm/StinkyAsmIR.hpp"
 #include "stinkytofu/serialization/asm/StinkyAsmEmitter.hpp"
+#include "stinkytofu/transforms/asm/LegalizationUtils.hpp"
+#include <nanobind/stl/vector.h>
 
 namespace nb = nanobind;
 using namespace stinkytofu;
@@ -847,11 +856,333 @@ std::string emitAsm(const std::string& archName, uint32_t waveSize, const nb::li
     return emitter.emit(function);
 }
 
+
+// ---------------------------------------------------------------------------------------------------
+// AsmBuilder: build Asm IR directly from Python, one call per IR object.  No item records.
+// ---------------------------------------------------------------------------------------------------
+
+std::vector<StinkyRegister> registerList(const nb::list& values, const char* what, size_t index) {
+    std::vector<StinkyRegister> result;
+    result.reserve(values.size());
+    size_t operandIndex = 0;
+    for (nb::handle operand : values) {
+        if (!nb::isinstance<StinkyRegister>(operand))
+            fail(index, std::string(what) + "[" + std::to_string(operandIndex) + "] must be a Register");
+        result.push_back(nb::cast<StinkyRegister>(operand));
+        ++operandIndex;
+    }
+    return result;
+}
+
+class AsmBuilder {
+  public:
+    AsmBuilder(const std::string& archName, uint32_t waveSize, const std::string& moduleName,
+               std::array<int, 3> archTriple, const nb::object& optionsObj)
+        : waveSize_(waveSize) {
+        const auto& archHelper = ArchHelper::getInstance();
+        archInfo_ = archHelper.getArchInfo(archName);
+        if (!archInfo_)
+            throw nb::value_error(("AsmBuilder: unsupported architecture '" + archName + "'").c_str());
+        if (waveSize != archInfo_->waveFrontSize)
+            throw nb::value_error(("AsmBuilder: wave_size " + std::to_string(waveSize) +
+                                   " does not match " + archName)
+                                      .c_str());
+        arch_ = archHelper.getGfxArchID(archName);
+        archName_ = archName;
+
+        StinkyAsmModule::ModuleOptions moduleOptions{};
+        moduleOptions.SwInstructionPrefetchAbsBaseSgpr = -1;
+        moduleOptions.DsReadOrder = -1;
+        if (nb::isinstance<nb::dict>(optionsObj)) {
+            nb::dict options = nb::cast<nb::dict>(optionsObj);
+#define SET_MODULE_OPTION_AB(name, type)                                              \
+    if (options.contains(#name) && !nb::try_cast<type>(options[#name], moduleOptions.name)) \
+        throw nb::value_error("AsmBuilder: option '" #name "' has the wrong type");
+            MODULE_OPTIONS_LIST(SET_MODULE_OPTION_AB)
+#define SET_MODULE_OPTION_WITH_DEFAULT_AB(name, type, value) SET_MODULE_OPTION_AB(name, type)
+            MODULE_OPTIONS_WITH_DEFAULTS_LIST(SET_MODULE_OPTION_WITH_DEFAULT_AB)
+#undef SET_MODULE_OPTION_WITH_DEFAULT_AB
+#undef SET_MODULE_OPTION_AB
+        } else if (!optionsObj.is_none()) {
+            throw nb::value_error("AsmBuilder: options must be a dict or None");
+        }
+        module_ = std::make_shared<StinkyAsmModule>(moduleName, archTriple, moduleOptions);
+        if (auto* pipeline = BackendRegistry::getArchPipeline(archTriple)) {
+            for (const auto& groupName : pipeline->groupNames) module_->addGroup(groupName);
+        }
+        builder_ = std::make_unique<AsmIRBuilder>(*module_->getFunction().getEntryBlock(), arch_);
+    }
+
+    bool hasPromoted(const std::string& mnemonic) const {
+        const HwInstDesc* desc = lookup(mnemonic);
+        return desc->promotedFormat != MicrocodeFormat::NONE && !desc->promotedFields.empty();
+    }
+
+    /// Do these operands fit the primary (short) encoding of `mnemonic`?  A query; nothing is built.
+    bool fitsPrimary(const std::string& mnemonic, const nb::list& dst, const nb::list& src) const {
+        const HwInstDesc* desc = lookup(mnemonic);
+        auto dests = registerList(dst, "dst", count_);
+        auto srcs = registerList(src, "src", count_);
+        try {
+            validateOperandCounts(*desc, dests.size(), srcs.size(), false, count_);
+            validateOperands(*desc, dests, srcs, *archInfo_, arch_, false, count_);
+        } catch (const nb::python_error&) {
+            throw;
+        } catch (const std::exception&) {
+            return false;
+        }
+        return true;
+    }
+
+    /// Destination slots the descriptor marks read-write (independent of modifiers).
+    std::vector<int> readWriteDests(const std::string& mnemonic, bool promoted) const {
+        const HwInstDesc* desc = lookup(mnemonic);
+        if (promoted && !hasPromoted(mnemonic))
+            fail(count_, "instruction '" + mnemonic + "' has no promoted encoding");
+        const auto& fields = promoted ? desc->promotedFields : desc->operandFields;
+        std::vector<int> result;
+        int slot = 0;
+        for (const auto& field : fields) {
+            if (!field.isDest) continue;
+            if (field.isReadWrite) result.push_back(slot);
+            ++slot;
+        }
+        return result;
+    }
+
+    void instruction(const std::string& mnemonic, const nb::list& dst, const nb::list& src,
+                     bool promoted, const nb::list& implicitSrc, const nb::object& modifiers,
+                     const nb::object& target, const std::string& comment, bool legalize) {
+        checkOpen();
+        const HwInstDesc* desc = lookup(mnemonic);
+        if (promoted && !hasPromoted(mnemonic))
+            fail(count_, "instruction '" + mnemonic + "' has no promoted encoding");
+
+        auto dests = registerList(dst, "dst", count_);
+        auto srcs = registerList(src, "src", count_);
+        if (hasLabelField(*desc)) {
+            if (target.is_none())
+                fail(count_, "branch instruction '" + mnemonic + "' requires 'target'");
+            if (!srcs.empty())
+                fail(count_, "branch instruction '" + mnemonic + "' takes 'target', not src operands");
+            if (!PyUnicode_Check(target.ptr())) fail(count_, "'target' must be a string");
+            std::string name = nb::cast<std::string>(target);
+            if (!isLabelName(name)) fail(count_, "'target' is not a valid label name");
+            srcs.emplace_back(name);
+            branchTargets_.emplace_back(name, count_);
+        } else if (!target.is_none()) {
+            fail(count_, "'target' is only valid for an instruction with a label operand");
+        }
+        validateOperandCounts(*desc, dests.size(), srcs.size(), promoted, count_);
+        validateOperands(*desc, dests, srcs, *archInfo_, arch_, promoted, count_);
+
+        // Promoted descriptors and their mnemonic storage must outlive every IR object that refers
+        // to them (same scheme as emit_asm, but the module outlives this call).
+        static std::vector<std::unique_ptr<std::string>> selectedMnemonicStorage;
+        static std::vector<std::unique_ptr<HwInstDesc>> selectedDescriptorStorage;
+        const HwInstDesc* selectedDesc = desc;
+        if (promoted) {
+            selectedMnemonicStorage.push_back(std::make_unique<std::string>(mnemonic + "_e64"));
+            auto selected = std::make_unique<HwInstDesc>(*desc);
+            selected->mnemonic = selectedMnemonicStorage.back()->c_str();
+            selected->microcode = desc->promotedFormat;
+            selected->operandFields = desc->promotedFields;
+            selected->promotedFormat = MicrocodeFormat::NONE;
+            selected->promotedFields = {};
+            selectedDescriptorStorage.push_back(std::move(selected));
+            selectedDesc = selectedDescriptorStorage.back().get();
+        }
+
+        StinkyInstruction* inst = builder_->create(selectedDesc);
+        inst->setDestRegs(dests);
+        inst->setSrcRegs(srcs);
+        if (!modifiers.is_none()) {
+            nb::dict record;
+            record["modifiers"] = modifiers;
+            addModifiers(*inst, record, count_);
+        }
+        if (!comment.empty()) {
+            if (comment.find_first_of("\r\n") != std::string::npos)
+                fail(count_, "'comment' must be a single line");
+            inst->addModifier(CommentData{comment});
+        }
+        if (legalize) {
+            // As the rocisa conversion does (ToStinkyTofuUtils.cpp legalizeInstruction): SCC/VCC/EXEC
+            // accesses declared by descriptor flags, then the hidden source of each read-write
+            // destination.  After the modifiers: op_sel is half of the read-write answer.
+            legalizeImplicitSpecialRegisters(inst, waveSize_);
+            legalizeReadWriteSources(inst);
+        }
+        // Liveness only the producer knows.  Appended last, where the emitter prints nothing.
+        for (const StinkyRegister& reg : registerList(implicitSrc, "implicit_src", count_)) {
+            const auto& present = inst->getSrcRegs();
+            if (std::find(present.begin(), present.end(), reg) == present.end()) inst->addSrcReg(reg);
+        }
+        ++count_;
+    }
+
+    void label(const std::string& name, int64_t alignment) {
+        checkOpen();
+        if (!isLabelName(name)) fail(count_, "'" + name + "' is not a valid label name");
+        if (!labels_.insert(name).second) fail(count_, "duplicate label '" + name + "'");
+        if (alignment < 1 || alignment > std::numeric_limits<uint16_t>::max() ||
+            (alignment & (alignment - 1)) != 0)
+            fail(count_, "label alignment must be a power of two in [1, 65535]");
+        labelNodes_[name] = builder_->createLabel(name, static_cast<uint16_t>(alignment));
+        ++count_;
+    }
+
+    /// Give the instruction group `group` (one of the names the
+    /// arch pipeline registered, e.g. "loopWithPrefetch") the range that starts at the label
+    /// instruction `first_label` and ends at the last instruction before the label `end_label`
+    /// (comment / blank / align directives directly before `end_label` are left outside), or at
+    /// `end_label` itself with end_inclusive=True.  Only stores the range with the core call
+    /// StinkyAsmModule::setGroupRange; nothing is built or moved.  Allowed before or after
+    /// finish(), but must be called before runOptimizationPipeline() (it uses the label nodes
+    /// recorded when they were built).  Returns what the range holds, for the caller to check.
+    nb::dict setGroupRangeByLabels(const std::string& group, const std::string& firstLabel,
+                                   const std::string& endLabel, bool endInclusive) {
+        if (!module_->hasGroup(group))
+            throw nb::value_error(("set_group_range: the pipeline registered no group '" + group + "'")
+                                      .c_str());
+        auto firstIt = labelNodes_.find(firstLabel);
+        auto endIt = labelNodes_.find(endLabel);
+        if (firstIt == labelNodes_.end() || endIt == labelNodes_.end())
+            throw nb::value_error("set_group_range: unknown label");
+        StinkyInstruction* first = firstIt->second;
+        StinkyInstruction* endNode = endIt->second;
+        BasicBlock* entry = module_->getFunction().getEntryBlock();
+        if (first->getParent() != entry || endNode->getParent() != entry)
+            throw nb::value_error("set_group_range: a label is not in the entry block");
+        // Walk forward from first to end_label: end_label must come after first_label.
+        IRBase* last = nullptr;
+        for (IRBase* node = first; node != endNode; node = node->getNext()) {
+            if (node == nullptr)
+                throw nb::value_error("set_group_range: end_label does not follow first_label");
+            if (dyn_cast<StinkyInstruction>(node)) last = node;
+        }
+        if (endInclusive) last = endNode;
+        if (last == nullptr) throw nb::value_error("set_group_range: empty range");
+        module_->setGroupRange(group, IntrusiveListIterator<IRBase>(first),
+                               IntrusiveListIterator<IRBase>(last));
+        size_t nodes = 0, instructions = 0, labels = 0, directives = 0;
+        for (IRBase* node = first;; node = node->getNext()) {
+            ++nodes;
+            if (auto* inst = dyn_cast<StinkyInstruction>(node)) {
+                if (isLabel(*inst)) ++labels;
+                else ++instructions;
+            } else {
+                ++directives;
+            }
+            if (node == last) break;
+        }
+        auto* lastInst = dyn_cast<StinkyInstruction>(last);
+        nb::dict info;
+        info["group"] = group;
+        info["first"] = firstLabel;
+        info["last_mnemonic"] = std::string(lastInst->getHwInstDesc()->mnemonic);
+        if (const auto* data = lastInst->getModifier<LabelData>()) info["last_label"] = data->label;
+        info["nodes"] = nodes;
+        info["instructions"] = instructions;
+        info["labels"] = labels;
+        info["directives"] = directives;
+        return info;
+    }
+
+    void align(int64_t bytes) {
+        checkOpen();
+        if (bytes < 1 || bytes > std::numeric_limits<int32_t>::max() || (bytes & (bytes - 1)) != 0)
+            fail(count_, "alignment must be a power of two in [1, 2147483647]");
+        AsmDirective* directive = builder_->createIR<AsmDirective>();
+        directive->kind = AsmDirectiveKind::ALIGN;
+        directive->name = ".align";
+        directive->intValue = bytes;
+        ++count_;
+    }
+
+    void comment(const std::string& text) {
+        checkOpen();
+        AsmDirective* directive = builder_->createIR<AsmDirective>();
+        directive->kind = AsmDirectiveKind::TEXTBLOCK;
+        directive->value = validateStandaloneComment(text, count_);
+        ++count_;
+    }
+
+    void blank() {
+        checkOpen();
+        AsmDirective* directive = builder_->createIR<AsmDirective>();
+        directive->kind = AsmDirectiveKind::TEXTBLOCK;
+        directive->value = "\n";
+        ++count_;
+    }
+
+    /// Check branch targets and hand the module over.  The builder is closed afterwards.
+    std::shared_ptr<StinkyAsmModule> finish() {
+        checkOpen();
+        for (const auto& [target, source] : branchTargets_) {
+            if (!labels_.contains(target)) fail(source, "undefined branch target '" + target + "'");
+        }
+        finished_ = true;
+        return module_;
+    }
+
+  private:
+    const HwInstDesc* lookup(const std::string& mnemonic) const {
+        const auto& mnemonicMap = archInfo_->getMnemonicToIsaOpcodeMap();
+        auto opcodeIt = mnemonicMap.find(mnemonic);
+        if (opcodeIt == mnemonicMap.end())
+            fail(count_, "unknown instruction '" + mnemonic + "' for " + archName_);
+        const HwInstDesc* desc = getMCIDByIsaOp(opcodeIt->second, arch_);
+        if (!desc || !desc->mnemonic)
+            fail(count_, "instruction '" + mnemonic + "' has no hardware descriptor");
+        return desc;
+    }
+
+    void checkOpen() const {
+        if (finished_) throw nb::value_error("AsmBuilder: finish() was already called");
+    }
+
+    const ArchHelper::ArchInfo* archInfo_ = nullptr;
+    GfxArchID arch_{};
+    std::string archName_;
+    uint32_t waveSize_;
+    std::shared_ptr<StinkyAsmModule> module_;
+    std::unique_ptr<AsmIRBuilder> builder_;
+    std::unordered_set<std::string> labels_;
+    std::unordered_map<std::string, StinkyInstruction*> labelNodes_;  // for set_group_range
+    std::vector<std::pair<std::string, size_t>> branchTargets_;
+    size_t count_ = 0;
+    bool finished_ = false;
+};
+
 }  // namespace
 
 // Called from python_bindings.cpp, which declares it, so it cannot have internal linkage.
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 void init_asm_bridge(nb::module_& m) {
+    nb::class_<AsmBuilder>(m, "AsmBuilder",
+                           "Build Asm IR directly: one call per instruction / label / comment, then "
+                           "finish() returns the StinkyAsmModule for runOptimizationPipeline().")
+        .def(nb::init<const std::string&, uint32_t, const std::string&, std::array<int, 3>,
+                      const nb::object&>(),
+             nb::arg("arch"), nb::arg("wave_size"), nb::arg("name"), nb::arg("arch_triple"),
+             nb::arg("options") = nb::none())
+        .def("has_promoted", &AsmBuilder::hasPromoted, nb::arg("mnemonic"))
+        .def("fits_primary", &AsmBuilder::fitsPrimary, nb::arg("mnemonic"), nb::arg("dst"),
+             nb::arg("src"))
+        .def("read_write_dests", &AsmBuilder::readWriteDests, nb::arg("mnemonic"),
+             nb::arg("promoted") = false)
+        .def("instruction", &AsmBuilder::instruction, nb::arg("mnemonic"), nb::arg("dst"),
+             nb::arg("src"), nb::kw_only(), nb::arg("promoted") = false,
+             nb::arg("implicit_src") = nb::list(), nb::arg("modifiers") = nb::none(),
+             nb::arg("target") = nb::none(), nb::arg("comment") = "", nb::arg("legalize") = true)
+        .def("label", &AsmBuilder::label, nb::arg("name"), nb::arg("alignment") = 1)
+        .def("align", &AsmBuilder::align, nb::arg("bytes"))
+        .def("comment", &AsmBuilder::comment, nb::arg("text"))
+        .def("blank", &AsmBuilder::blank)
+        .def("set_group_range", &AsmBuilder::setGroupRangeByLabels, nb::arg("group"),
+             nb::arg("first_label"), nb::arg("end_label"), nb::arg("end_inclusive") = false)
+        .def("finish", &AsmBuilder::finish);
     m.def("emit_asm", &emitAsm, nb::arg("arch"), nb::arg("wave_size"), nb::arg("items"),
           R"doc(Emit ordered, already-selected assembly records through temporary Asm IR.
 

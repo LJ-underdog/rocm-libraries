@@ -573,11 +573,11 @@ DEF_BATCH(.format = SOP2,
 DEF_T(SMovkI32Inst, "s_movk_i32", .format = SOPK, .logical = "SMovkI32",
     .operand_fields = { {D0, sdst, sdst, 32}, {S0, simm16, simm16, 16} })
 DEF_T(SAddkCoI32Inst, "s_addk_co_i32", .format = SOPK, .flags = {ImplicitWriteSCC},
-    .operand_fields = { {D0, sdst, sdst, 32}, {S0, simm16, simm16, 16} })
+    .operand_fields = { {D0, sdst, sdst, 32, RW}, {S0, simm16, simm16, 16} })
 DEF_T(SBitset0B32Inst, "s_bitset0_b32", .format = SOPK, .flags = {ImplicitWriteSCC},
-    .operand_fields = { {D0, sdst, sdst, 32}, {S0, simm16, simm5, 5} })
+    .operand_fields = { {D0, sdst, sdst, 32, RW}, {S0, simm16, simm5, 5} })
 DEF_T(SBitset1B32Inst, "s_bitset1_b32", .format = SOPK, .flags = {ImplicitWriteSCC},
-    .operand_fields = { {D0, sdst, sdst, 32}, {S0, simm16, simm5, 5} })
+    .operand_fields = { {D0, sdst, sdst, 32, RW}, {S0, simm16, simm5, 5} })
 
 DEF_BATCH(.format = SMRD_LOAD,
     SLoadB32Inst, "s_load_b32", .logical = "SLoadB32",

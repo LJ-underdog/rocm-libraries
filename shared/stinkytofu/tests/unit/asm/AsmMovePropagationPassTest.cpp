@@ -180,6 +180,42 @@ TEST_F(AsmMovePropagationPassTest, SwmmacAccumulatorDestOnlyKeepsSeedMov) {
     EXPECT_EQ(countMnemonic("v_mov_b32"), 1u) << "the mov seeding the accumulator was erased";
 }
 
+// s_addk_co_i32 adds to the register it writes, and raw asm lists it only as a dest. The
+// s_mov before it supplies the addend, so it must stay.
+TEST_F(AsmMovePropagationPassTest, AddkDestOnlyKeepsSeedMov) {
+    emit("s_mov_b32", {sgpr(5)}, {sgpr(7)});
+    emit("s_addk_co_i32", {sgpr(5)}, {StinkyRegister(1)});
+
+    runPass();
+
+    EXPECT_EQ(countMnemonic("s_mov_b32"), 1u) << "the mov seeding the addend was erased";
+}
+
+// s_bitset0_b32 / s_bitset1_b32 change one bit and keep the others.
+TEST_F(AsmMovePropagationPassTest, BitsetDestOnlyKeepsSeedMov) {
+    emit("s_mov_b32", {sgpr(5)}, {sgpr(7)});
+    emit("s_bitset0_b32", {sgpr(5)}, {StinkyRegister(3)});
+    emit("s_mov_b32", {sgpr(6)}, {sgpr(8)});
+    emit("s_bitset1_b32", {sgpr(6)}, {StinkyRegister(20)});
+
+    runPass();
+
+    EXPECT_EQ(countMnemonic("s_mov_b32"), 2u) << "a mov seeding the other bits was erased";
+}
+
+// With the read listed as a source (as legalizeReadWriteSources adds it), the tied read is
+// not rewritten to the mov's source either.
+TEST_F(AsmMovePropagationPassTest, TiedAddkReadIsNotPropagatedAndSeedMovSurvives) {
+    emit("s_mov_b32", {sgpr(5)}, {sgpr(7)});
+    StinkyInstruction* addk = emit("s_addk_co_i32", {sgpr(5)}, {StinkyRegister(1), sgpr(5)});
+
+    runPass();
+
+    EXPECT_TRUE(reads(*addk, sgpr(5))) << "tied read-write source was rewritten";
+    EXPECT_FALSE(reads(*addk, sgpr(7)));
+    EXPECT_EQ(countMnemonic("s_mov_b32"), 1u) << "the mov seeding s5 was erased";
+}
+
 // A plain dest is still a redefinition, so the earlier mov is dead.
 TEST_F(AsmMovePropagationPassTest, PlainRedefinitionStillErasesSeedMov) {
     emit("v_mov_b32", {vgpr(20)}, {sgpr(14)});

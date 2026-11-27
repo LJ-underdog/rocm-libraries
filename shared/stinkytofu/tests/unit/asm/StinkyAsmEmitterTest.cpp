@@ -1403,3 +1403,56 @@ TEST_F(AsmEmitterTest, EmitVccRegister) {
 
     EXPECT_NE(assembly.find("vcc"), std::string::npos);
 }
+
+// ============================================================================
+// ExplicitSrcCountData: sources appended only for dependency tracking
+// ============================================================================
+
+// s_wait_idle has no operand fields, so without the count every source prints.
+TEST_F(AsmEmitterTest, ExplicitSrcCountHidesTrackingSourcesOfFieldlessInstruction) {
+    StinkyInstruction* inst = createInstruction("s_wait_idle");
+    ASSERT_NE(inst, nullptr);
+    inst->addSrcReg(StinkyRegister("s", 4, 2));
+
+    AsmEmitterOptions options;
+    options.indent = 0;
+    StinkyAsmEmitter emitter(options);
+    EXPECT_EQ(emitter.emit(*inst), "s_wait_idle s[4:5]\n");
+
+    inst->addModifier(ExplicitSrcCountData(0));
+    EXPECT_EQ(emitter.emit(*inst), "s_wait_idle\n");
+}
+
+// The two-source tensor form has fewer sources than its descriptor's four fields.
+TEST_F(AsmEmitterTest, ExplicitSrcCountHidesTrackingSourcesOfShortTensorForm) {
+    StinkyInstruction* inst = createInstruction("tensor_load_to_lds");
+    ASSERT_NE(inst, nullptr);
+    inst->addSrcReg(StinkyRegister("s", 8, 4));
+    inst->addSrcReg(StinkyRegister("s", 12, 8));
+    inst->addSrcReg(StinkyRegister("s", 40, 4));
+    inst->addSrcReg(StinkyRegister("s", 44, 4));
+    inst->addModifier(ExplicitSrcCountData(2));
+
+    AsmEmitterOptions options;
+    options.indent = 0;
+    StinkyAsmEmitter emitter(options);
+    EXPECT_EQ(emitter.emit(*inst), "tensor_load_to_lds s[8:11], s[12:19]\n");
+}
+
+// A count at or above the number of sources the fields print changes nothing. s_wait_kmcnt
+// has one source field: count 1 equals it, 2 equals the number of sources, 5 exceeds both.
+TEST_F(AsmEmitterTest, ExplicitSrcCountAtOrAboveFieldCountChangesNothing) {
+    AsmEmitterOptions options;
+    options.indent = 0;
+    StinkyAsmEmitter emitter(options);
+    for (const size_t count : {size_t{1}, size_t{2}, size_t{5}}) {
+        StinkyInstruction* inst = createInstruction("s_wait_kmcnt");
+        ASSERT_NE(inst, nullptr);
+        inst->addSrcReg(StinkyRegister(0));
+        inst->addSrcReg(StinkyRegister("s", 20, 2));
+        const std::string withoutCount = emitter.emit(*inst);
+        inst->addModifier(ExplicitSrcCountData(count));
+        EXPECT_EQ(emitter.emit(*inst), withoutCount) << "count " << count;
+        EXPECT_EQ(withoutCount, "s_wait_kmcnt 0\n");
+    }
+}

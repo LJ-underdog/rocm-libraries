@@ -24,10 +24,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "stinkytofu/ir/asm/StinkyAsmIR.hpp"
@@ -125,6 +129,35 @@ std::string StinkyAsmModule::getOutputDir() const {
 
 bool StinkyAsmModule::ModuleOptions::sgprsCompacted() const {
     return kernelRewritesRegisters(RegisterAllocation, RegisterAllocationConfig, RegType::S);
+}
+
+Expected<StinkyAsmModule::ModuleOptions::KeepAuthoredParts>
+StinkyAsmModule::ModuleOptions::keepAuthored() const {
+    using Parts = KeepAuthoredParts;
+    static constexpr std::pair<std::string_view, bool Parts::*> kTokens[] = {
+        {"nop", &Parts::nop}, {"mov", &Parts::mov}, {"reuse", &Parts::reuse}};
+    Parts parts;
+    std::string_view rest = KeepAuthored;
+    while (true) {
+        const size_t comma = rest.find(',');
+        std::string_view token = rest.substr(0, comma);
+        const size_t first = token.find_first_not_of(" \t");
+        token = first == std::string_view::npos
+                    ? std::string_view()
+                    : token.substr(first, token.find_last_not_of(" \t") - first + 1);
+        if (!token.empty()) {
+            const auto* known =
+                std::find_if(std::begin(kTokens), std::end(kTokens),
+                             [&](const auto& entry) { return entry.first == token; });
+            if (known == std::end(kTokens))
+                return Expected<Parts>::Error("KeepAuthored: unknown token '" + std::string(token) +
+                                              "' (known tokens: nop, mov, reuse)");
+            parts.*(known->second) = true;
+        }
+        if (comma == std::string_view::npos) break;
+        rest.remove_prefix(comma + 1);
+    }
+    return parts;
 }
 
 std::array<int, 3> StinkyAsmModule::getArch() const {

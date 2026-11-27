@@ -604,6 +604,14 @@ static bool isOmittedFlatSaddrOperand(const StinkyRegister& reg,
            (mnemonic == "flat_store_b32" && emittedSrcIndex == 2);
 }
 
+/// The source registers the emitter may print: all of them, or the leading ones an
+/// ExplicitSrcCountData names (the rest were added only for dependency tracking).
+static size_t printableSrcRegCount(const StinkyInstruction& inst) {
+    const size_t count = inst.getSrcRegs().size();
+    const auto* explicitSrcs = inst.getModifier<ExplicitSrcCountData>();
+    return explicitSrcs != nullptr ? std::min(count, explicitSrcs->count) : count;
+}
+
 static void emitOperands(std::ostream& os, const StinkyInstruction& inst,
                          const AsmEmitterOptions& options) {
     bool firstOperand = true;
@@ -658,7 +666,8 @@ static void emitOperands(std::ostream& os, const StinkyInstruction& inst,
 
     // Emit source registers with VOP3 modifiers if present (skip pseudo and implicit registers)
     size_t nonSkippedIndex = 0;  // Track the index of non-skipped operands
-    for (size_t i = 0; i < srcRegs.size(); ++i) {
+    const size_t printableSrcRegs = printableSrcRegCount(inst);
+    for (size_t i = 0; i < printableSrcRegs; ++i) {
         if (isPseudoReg(srcRegs[i]) || isImplicitSrc(srcRegs[i], inst)) continue;
 
         if (nonSkippedIndex >= emitSrcCount) break;
@@ -988,7 +997,7 @@ void StinkyAsmEmitter::emit(std::ostream& os, const StinkyInstruction& inst) {
 
     if (emitCustomOperands(instrStream, inst)) {
         // Emit custom operands for special instructions, or regular operands if not custom
-    } else if (!inst.getDestRegs().empty() || !inst.getSrcRegs().empty()) {
+    } else if (!inst.getDestRegs().empty() || printableSrcRegCount(inst) > 0) {
         // Emit regular operands if any
         instrStream << " ";
         emitOperands(instrStream, inst, options);

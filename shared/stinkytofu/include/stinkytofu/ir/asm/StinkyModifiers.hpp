@@ -315,6 +315,7 @@ struct Modifier {
         CALL_TARGETS,
         EXEC_GROUP,
         TENSOR,
+        EXPLICIT_SRC_COUNT,
     };
 
     Modifier(Type type) : type(type) {}
@@ -1112,6 +1113,20 @@ struct CommentData : public TypedModifier<CommentData> {
     CommentData(const std::string& comment) : TypedModifier<CommentData>(), comment(comment) {}
 
     std::string comment;
+};
+
+/// How many leading source registers are operands of the instruction. A producer that
+/// appends sources only so that dependency tracking sees them records the count here,
+/// and the emitter prints no source after it. Without this modifier the emitter prints
+/// up to as many sources as the descriptor has source fields, or every source when the
+/// descriptor has no operand fields.
+struct ExplicitSrcCountData : public TypedModifier<ExplicitSrcCountData> {
+    static constexpr Modifier::Type Type = Modifier::Type::EXPLICIT_SRC_COUNT;
+
+    explicit ExplicitSrcCountData(size_t count)
+        : TypedModifier<ExplicitSrcCountData>(), count(count) {}
+
+    size_t count;
 };
 
 struct MemTokenData : public TypedModifier<MemTokenData> {

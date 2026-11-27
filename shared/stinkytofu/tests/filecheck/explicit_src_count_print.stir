@@ -1,0 +1,14 @@
+# RUN: %stinkytofu-opt --arch gfx1250 %s --print-output
+#
+# mod.explicit_src_count survives a print and parse of the IR, so a dumped module still
+# hides its dependency-tracking sources when emitted.
+#
+# CHECK-LABEL: @tracking_sources
+# CHECK: "st.s_wait_idle"(s[4:5])
+# CHECK-SAME: mod.explicit_src_count = { count = 0 }
+
+st.func @tracking_sources() {
+^entry:
+  "st.s_wait_idle"(s[4:5]) { issueCycles = 1, latencyCycles = 1, mod.explicit_src_count = { count = 0 } }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}

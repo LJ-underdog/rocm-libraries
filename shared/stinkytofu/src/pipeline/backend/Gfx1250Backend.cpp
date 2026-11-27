@@ -89,7 +89,7 @@ constexpr std::array<int, 3> GFX1250_ARCH{12, 5, 0};
 /// bring-up phase. Once the pipeline stabilizes, pass selection should
 /// be controlled by OptLevel.
 void addGfx1250RegionPasses(PassManager& pm, const StinkyAsmModule& module, OptLevel optLevel,
-                            bool enableWaitCnt, bool runScheduler) {
+                            bool enableWaitCnt, bool runScheduler, bool removeNops) {
     // Verify IR integrity before running any passes
     // This catches IR corruption early before it propagates through optimization
     pm.addPass(createStinkyIRVerifierPass());
@@ -101,7 +101,7 @@ void addGfx1250RegionPasses(PassManager& pm, const StinkyAsmModule& module, OptL
         RemoveWaitCntOptions removeOptions;
         removeOptions.removeXcnt = (optLevel == OptLevel::O3);
         pm.addPass(createStinkyRemoveWaitCntPass(removeOptions));
-        pm.addPass(createStinkyRemoveNopPass());
+        if (removeNops) pm.addPass(createStinkyRemoveNopPass());
     }
 
     // addPeepholeOptPasses(pm, optLevel);
@@ -138,6 +138,15 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
     const bool runScheduler = optLevel != OptLevel::O0;
     auto debugStreams = createDebugOutputStreams(moduleOptions);
 
+    // KeepAuthored (Module.hpp): producer code the passes below leave as written.
+    // A bad token is a misconfigured module, like an unset tile config at the
+    // backend entry, so it stops the build instead of running passes the caller
+    // asked to skip.
+    const Expected<StinkyAsmModule::ModuleOptions::KeepAuthoredParts> keepAuthored =
+        moduleOptions.keepAuthored();
+    if (keepAuthored.hasError()) report_fatal_error(keepAuthored.getError());
+    const StinkyAsmModule::ModuleOptions::KeepAuthoredParts& keep = *keepAuthored;
+
     configureModuleInstrumentations(mpm, moduleOptions, "module", debugStreams, &module);
 
     if (runScheduler || moduleOptions.EnableESM2) {
@@ -151,7 +160,7 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
     // Region scheduling + kernel setup (entry only).
     {
         PassManager pm = makeEntryPM(module, debugStreams);
-        pm.addPass(createStinkyRemoveNopPass(/*vNopOnly=*/true));
+        if (!keep.nop) pm.addPass(createStinkyRemoveNopPass(/*vNopOnly=*/true));
         PB.applyExtensionPoint(PipelineExtensionPoint::BeforeRegionPasses, pm, module);
 
         // -- region: loopWithPrefetch + noLoadLoopBody --
@@ -224,7 +233,7 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
                                               "loopWithPrefetch+noLoadLoopBody", debugStreams);
             PB.applyExtensionPoint(PipelineExtensionPoint::InnerRegionBegin, innerPM, module);
             addGfx1250RegionPasses(innerPM, module, optLevel, moduleOptions.EnableWaitCntInsertion,
-                                   runScheduler);
+                                   runScheduler, /*removeNops=*/!keep.nop);
             PB.applyExtensionPoint(PipelineExtensionPoint::InnerRegionEnd, innerPM, module);
             if (moduleOptions.EnableWaitCntInsertion) {
                 WaitCntInsertionOptions waitCntOptions;
@@ -303,7 +312,7 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
         mpm.addPass(createMainOnlyAdaptor(std::move(pm)));
     }
 
-    mpm.addPass(createFunctionToModuleAdaptor(createAsmMovePropagationPass()));
+    if (!keep.mov) mpm.addPass(createFunctionToModuleAdaptor(createAsmMovePropagationPass()));
 
     // MSB is materialized for the entry function and every callable function
     // (each function owns its VGPR MSB hardware state).
@@ -339,7 +348,7 @@ bool buildGfx1250Pipeline(ModulePassManager& mpm, StinkyAsmModule& module, const
     // Whole-kernel reuse on final instruction order (O0 and O1+; after scheduler
     // + VGPR MSB). Per function, each in isolation (reuse never chains across a
     // call site or a function boundary).
-    mpm.addPass(createFunctionToModuleAdaptor(createSetMatrixReusePass()));
+    if (!keep.reuse) mpm.addPass(createFunctionToModuleAdaptor(createSetMatrixReusePass()));
 
     // Run after the final CFG build but before flatten/SW-prefetch: this pass
     // covers final per-function code, while SW-prefetch owns its hints' XCnt

@@ -2,35 +2,52 @@
 // SPDX-License-Identifier: MIT
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <deque>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "stinkytofu/analysis/asm/AsmVerifierPass.hpp"
+#include "stinkytofu/bindings/python/Module.hpp"
 #include "stinkytofu/core/Function.hpp"
 #include "stinkytofu/hardware/ArchHelper.hpp"
 #include "stinkytofu/hardware/HwReg.hpp"
 #include "stinkytofu/ir/asm/StinkyAsmDirectives.hpp"
 #include "stinkytofu/ir/asm/StinkyAsmIR.hpp"
+#include "stinkytofu/pipeline/BackendRegistry.hpp"
 #include "stinkytofu/serialization/asm/StinkyAsmEmitter.hpp"
+#include "stinkytofu/transforms/asm/LegalizationUtils.hpp"
 
 namespace nb = nanobind;
 using namespace stinkytofu;
 
 namespace {
 
+/// The AsmBuilder method running on this thread, or null. The checks AsmBuilder shares with
+/// emit_asm call fail() with an emit_asm record index; while a method runs, they report under
+/// its name instead.
+thread_local const char* tAsmBuilderMethod = nullptr;
+
 [[noreturn]] void fail(size_t itemIndex, const std::string& message) {
+    if (tAsmBuilderMethod != nullptr)
+        throw nb::value_error(
+            ("AsmBuilder." + std::string(tAsmBuilderMethod) + ": " + message).c_str());
     throw nb::value_error(("emit_asm item[" + std::to_string(itemIndex) + "]: " + message).c_str());
 }
 
@@ -179,12 +196,12 @@ std::vector<StinkyRegister> parseOperands(const nb::dict& record, const char* ke
 // gfx1250 buffer instructions encode an unsigned 23-bit immediate offset.
 constexpr int64_t kMaxMubufOffset = (int64_t{1} << 23) - 1;
 
-void addModifiers(StinkyInstruction& inst, const nb::dict& record, size_t itemIndex) {
+/// Apply a record's 'modifiers' value to \p inst; \p value is invalid when the record has none.
+void addModifiers(StinkyInstruction& inst, nb::handle value, size_t itemIndex) {
     // The typed buffer atomic always carries a VGPR vaddr, so it needs the offen addressing
     // mode; without the modifier the emitter would print a line that does not assemble.
     const bool requiresMubuf =
         std::string_view(inst.getHwInstDesc()->mnemonic) == "buffer_atomic_add_f32";
-    nb::handle value = find(record, "modifiers");
     if (!value.is_valid()) {
         if (requiresMubuf)
             fail(itemIndex, "buffer_atomic_add_f32 requires modifier 'mubuf' with offen=True");
@@ -377,6 +394,37 @@ void addModifiers(StinkyInstruction& inst, const nb::dict& record, size_t itemIn
     }
 }
 
+bool hasPromotedEncoding(const HwInstDesc& desc) {
+    return desc.promotedFormat != MicrocodeFormat::NONE && !desc.promotedFields.empty();
+}
+
+/// The promoted encoding of the table descriptor \p primary as a descriptor of its own: its
+/// promoted fields and format, the `_e64` mnemonic and, for VOP3, the 64-bit encoding size.
+/// One per primary descriptor, kept for the life of the process because IR built from it (an
+/// AsmBuilder module) can outlive any call.
+const HwInstDesc* promotedDescriptor(const HwInstDesc& primary) {
+    struct Promoted {
+        explicit Promoted(const HwInstDesc& primary)
+            : mnemonic(std::string(primary.mnemonic) + "_e64"), desc(primary) {}
+        std::string mnemonic;
+        HwInstDesc desc;
+    };
+    // Python calls hold the GIL, which serializes access.
+    static std::unordered_map<const HwInstDesc*, std::unique_ptr<Promoted>> cache;
+    std::unique_ptr<Promoted>& slot = cache[&primary];
+    if (!slot) {
+        slot = std::make_unique<Promoted>(primary);
+        slot->desc.mnemonic = slot->mnemonic.c_str();
+        slot->desc.microcode = primary.promotedFormat;
+        slot->desc.operandFields = primary.promotedFields;
+        // Every promoted format the gfx tables define is the 64-bit VOP3.
+        if (primary.promotedFormat == MicrocodeFormat::MC_VOP3) slot->desc.encoding = 64;
+        slot->desc.promotedFormat = MicrocodeFormat::NONE;
+        slot->desc.promotedFields = {};
+    }
+    return &slot->desc;
+}
+
 bool hasLabelField(const HwInstDesc& desc) {
     return std::any_of(desc.operandFields.begin(), desc.operandFields.end(),
                        [](const HwInstDesc::OperandFieldDesc& field) {
@@ -404,7 +452,7 @@ SelectedForm selectForm(const nb::dict& record, const HwInstDesc& desc,
     }
     if (form == primary) return SelectedForm::Primary;
     if (form == primary + "::vop3") {
-        if (desc.promotedFormat == MicrocodeFormat::NONE || desc.promotedFields.empty())
+        if (!hasPromotedEncoding(desc))
             fail(itemIndex, "form '" + form + "' requests a promoted encoding that instruction '" +
                                 mnemonic + "' does not provide");
         return SelectedForm::Promoted;
@@ -763,9 +811,8 @@ std::string emitAsm(const std::string& archName, uint32_t waveSize, const nb::li
     }
     const GfxArchID arch = archHelper.getGfxArchID(archName);
 
-    // Promoted descriptors and their mnemonic storage must outlive every IR
-    // object that refers to them, including Function destruction.
-    std::vector<std::unique_ptr<std::string>> selectedMnemonicStorage;
+    // The no-return descriptors must outlive every IR object that refers to them,
+    // including Function destruction.
     std::vector<std::unique_ptr<HwInstDesc>> selectedDescriptorStorage;
     std::deque<std::vector<HwInstDesc::OperandFieldDesc>> selectedFieldStorage;
     Function function("emit_asm");
@@ -844,24 +891,12 @@ std::string emitAsm(const std::string& archName, uint32_t waveSize, const nb::li
                                     std::any_of(dests.begin(), dests.end(), isM0) ||
                                     std::any_of(srcs.begin(), srcs.end(), isM0);
 
-            const HwInstDesc* selectedDesc = desc;
-            if (promoted) {
-                selectedMnemonicStorage.push_back(
-                    std::make_unique<std::string>(mnemonic + "_e64"));
-                auto selected = std::make_unique<HwInstDesc>(*desc);
-                selected->mnemonic = selectedMnemonicStorage.back()->c_str();
-                selected->microcode = desc->promotedFormat;
-                selected->operandFields = desc->promotedFields;
-                selected->promotedFormat = MicrocodeFormat::NONE;
-                selected->promotedFields = {};
-                selectedDescriptorStorage.push_back(std::move(selected));
-                selectedDesc = selectedDescriptorStorage.back().get();
-            }
+            const HwInstDesc* selectedDesc = promoted ? promotedDescriptor(*desc) : desc;
 
             StinkyInstruction* inst = builder.create(selectedDesc);
             inst->setDestRegs(dests);
             inst->setSrcRegs(srcs);
-            addModifiers(*inst, record, itemIndex);
+            addModifiers(*inst, find(record, "modifiers"), itemIndex);
             if (nb::handle comment = find(record, "comment"); comment.is_valid()) {
                 if (!PyUnicode_Check(comment.ptr()))
                     fail(itemIndex, "field 'comment' must be a string");
@@ -948,11 +983,549 @@ std::string emitAsm(const std::string& archName, uint32_t waveSize, const nb::li
     return emitter.emit(function);
 }
 
+// ---------------------------------------------------------------------------------------------
+// AsmBuilder: build Asm IR from Python, one call per node, for the optimization pipeline.
+// ---------------------------------------------------------------------------------------------
+
+/// Names the AsmBuilder method in the errors raised while it runs (see fail()).
+class AsmBuilderMethodScope {
+   public:
+    explicit AsmBuilderMethodScope(const char* method) : previous_(tAsmBuilderMethod) {
+        tAsmBuilderMethod = method;
+    }
+    ~AsmBuilderMethodScope() {
+        tAsmBuilderMethod = previous_;
+    }
+    AsmBuilderMethodScope(const AsmBuilderMethodScope&) = delete;
+    AsmBuilderMethodScope& operator=(const AsmBuilderMethodScope&) = delete;
+
+   private:
+    const char* previous_;
+};
+
+/// The Registers of an AsmBuilder list argument. Register numbers are full numbers, and
+/// StinkyTofu's VGPR-MSB pass derives Register.offset from them, so a nonzero offset is an error.
+std::vector<StinkyRegister> builderRegisters(const nb::list& values, const char* argument) {
+    std::vector<StinkyRegister> result;
+    result.reserve(values.size());
+    for (nb::handle value : values) {
+        const std::string where = std::string(argument) + "[" + std::to_string(result.size()) + "]";
+        if (!nb::isinstance<StinkyRegister>(value)) fail(0, where + " must be a Register");
+        StinkyRegister reg = nb::cast<StinkyRegister>(value);
+        if (reg.dataType == StinkyRegister::Type::Register && reg.reg.offset != 0)
+            fail(0, where +
+                        " has a nonzero Register.offset; pass the full register number "
+                        "(StinkyTofu derives the VGPR-MSB offset)");
+        result.push_back(std::move(reg));
+    }
+    return result;
+}
+
+/// Cast one options value. A bool is not taken for an integer option, nor an integer for a bool.
+template <typename T>
+bool castModuleOption(nb::handle value, T& out) {
+    if constexpr (std::is_same_v<T, bool>) {
+        if (!PyBool_Check(value.ptr())) return false;
+    } else if constexpr (std::is_integral_v<T>) {
+        if (PyBool_Check(value.ptr()) || !PyLong_Check(value.ptr())) return false;
+    }
+    return nb::try_cast<T>(value, out);
+}
+
+/// ModuleOptions from an AsmBuilder options dict. toStinkyTofuModule only warns about an unknown
+/// key or a wrongly typed value; here both are errors, because either would run the pipeline
+/// without a setting the caller asked for.
+StinkyAsmModule::ModuleOptions builderModuleOptions(const nb::object& optionsObject) {
+    StinkyAsmModule::ModuleOptions moduleOptions{};
+    // The unset values lower_logical_module starts from.
+    moduleOptions.SwInstructionPrefetchAbsBaseSgpr = -1;
+    moduleOptions.DsReadOrder = -1;
+    if (optionsObject.is_none()) return moduleOptions;
+    if (!PyDict_Check(optionsObject.ptr())) fail(0, "'options' must be a dict or None");
+    nb::dict options = nb::borrow<nb::dict>(optionsObject);
+    std::unordered_set<std::string> known;
+#define SET_BUILDER_MODULE_OPTION(name, type)                                   \
+    known.insert(#name);                                                        \
+    if (nb::handle value = find(options, #name);                                \
+        value.is_valid() && !castModuleOption<type>(value, moduleOptions.name)) \
+        fail(0, "option '" #name "' has the wrong type");
+#define SET_BUILDER_MODULE_OPTION_WITH_DEFAULT(name, type, defaultValue) \
+    SET_BUILDER_MODULE_OPTION(name, type)
+    MODULE_OPTIONS_LIST(SET_BUILDER_MODULE_OPTION)
+    MODULE_OPTIONS_WITH_DEFAULTS_LIST(SET_BUILDER_MODULE_OPTION_WITH_DEFAULT)
+#undef SET_BUILDER_MODULE_OPTION_WITH_DEFAULT
+#undef SET_BUILDER_MODULE_OPTION
+    Py_ssize_t position = 0;
+    PyObject* key = nullptr;
+    PyObject* value = nullptr;
+    while (PyDict_Next(options.ptr(), &position, &key, &value)) {
+        if (!PyUnicode_Check(key)) fail(0, "option keys must be strings");
+        const std::string name = nb::cast<std::string>(nb::handle(key));
+        if (!known.contains(name)) fail(0, "unknown option '" + name + "'");
+    }
+    return moduleOptions;
+}
+
+/// Mnemonics the gfx1250 descriptor table has but the assembler rejects, with the forms to use.
+const char* gfx1250AssemblerReplacement(std::string_view mnemonic) {
+    static constexpr std::pair<std::string_view, const char*> kRejected[] = {
+        {"ds_load_b192", "ds_load_b128 and ds_load_b64"},
+        {"ds_store_b192", "ds_store_b128 and ds_store_b64"},
+        {"ds_store_b256", "two ds_store_b128"},
+        {"s_waitcnt", "s_wait_loadcnt, s_wait_storecnt, s_wait_dscnt or s_wait_kmcnt"},
+        {"s_barrier", "s_barrier_signal -1 and s_barrier_wait -1"},
+    };
+    for (const auto& [rejected, replacement] : kRejected)
+        if (mnemonic == rejected) return replacement;
+    return nullptr;
+}
+
+/// The number of source fields of \p desc, or of its promoted encoding.
+size_t sourceFieldCount(const HwInstDesc& desc, bool promoted) {
+    const auto& fields = promoted ? desc.promotedFields : desc.operandFields;
+    return static_cast<size_t>(
+        std::count_if(fields.begin(), fields.end(),
+                      [](const HwInstDesc::OperandFieldDesc& field) { return !field.isDest; }));
+}
+
+/// The label instruction named \p name in \p block, or null.
+StinkyInstruction* findLabel(BasicBlock& block, const std::string& name) {
+    for (IRBase& node : block) {
+        auto* inst = dyn_cast<StinkyInstruction>(&node);
+        if (inst == nullptr || !isLabel(*inst)) continue;
+        if (const auto* data = inst->getModifier<LabelData>(); data && data->label == name)
+            return inst;
+    }
+    return nullptr;
+}
+
+class AsmBuilder {
+   public:
+    AsmBuilder(const std::string& archName, const std::string& moduleName,
+               const nb::object& options) {
+        AsmBuilderMethodScope scope("__init__");
+        const auto& archHelper = ArchHelper::getInstance();
+        archInfo_ = archHelper.getArchInfo(archName);
+        if (!archInfo_) fail(0, "unsupported architecture '" + archName + "'");
+        arch_ = archHelper.getGfxArchID(archName);
+        archName_ = archName;
+        const std::array<int, 3> triple{static_cast<int>(archInfo_->major),
+                                        static_cast<int>(archInfo_->minor),
+                                        static_cast<int>(archInfo_->stepping)};
+        const auto* pipeline = BackendRegistry::getArchPipeline(triple);
+        if (pipeline == nullptr || !pipeline->builder)
+            fail(0, "no optimization pipeline is registered for " + archName);
+
+        StinkyAsmModule::ModuleOptions moduleOptions = builderModuleOptions(options);
+        if (!moduleOptions.ArchName.empty() &&
+            archHelper.getArchInfo(moduleOptions.ArchName) != archInfo_)
+            fail(0, "option 'ArchName' names '" + moduleOptions.ArchName + "', not " + archName);
+        if (moduleOptions.wavefrontSize != 0 &&
+            moduleOptions.wavefrontSize != static_cast<int>(archInfo_->waveFrontSize))
+            fail(0, "option 'wavefrontSize' is " + std::to_string(moduleOptions.wavefrontSize) +
+                        ", but " + archName + " runs wave" +
+                        std::to_string(archInfo_->waveFrontSize));
+        if (const auto keep = moduleOptions.keepAuthored(); keep.hasError())
+            fail(0, keep.getError());
+
+        module_ = std::make_shared<StinkyAsmModule>(moduleName, triple, moduleOptions);
+        for (const auto& groupName : pipeline->groupNames) module_->addGroup(groupName);
+        builder_ = std::make_unique<AsmIRBuilder>(*module_->getFunction().getEntryBlock(), arch_);
+    }
+
+    std::vector<int> readWriteDests(const std::string& mnemonic, bool promoted) const {
+        AsmBuilderMethodScope scope("read_write_dests");
+        const HwInstDesc* desc = lookup(mnemonic);
+        if (promoted && !hasPromotedEncoding(*desc))
+            fail(0, "instruction '" + mnemonic + "' has no promoted encoding");
+        std::vector<int> result;
+        int position = 0;
+        for (const auto& field : promoted ? desc->promotedFields : desc->operandFields) {
+            if (!field.isDest) continue;
+            if (field.isReadWrite) result.push_back(position);
+            ++position;
+        }
+        return result;
+    }
+
+    void instruction(const std::string& mnemonic, const nb::list& dst, const nb::list& src,
+                     bool promoted, const nb::list& implicitSrc, const nb::object& modifiers,
+                     const nb::object& target, const std::string& comment, bool legalize) {
+        AsmBuilderMethodScope scope("instruction");
+        checkOpen();
+        // A rejected call leaves nothing behind: the checks run before the instruction is
+        // created, except addModifiers', which need it and erase it when they fail, and the
+        // bookkeeping comes last.
+        const HwInstDesc* desc = lookup(mnemonic);
+        if (archInfo_->major == 12 && archInfo_->minor == 5) {
+            if (const char* replacement = gfx1250AssemblerReplacement(mnemonic))
+                fail(0, "the assembler rejects '" + mnemonic + "' on " + archName_ + "; use " +
+                            replacement);
+        }
+        if (promoted && !hasPromotedEncoding(*desc))
+            fail(0, "instruction '" + mnemonic + "' has no promoted encoding");
+
+        std::vector<StinkyRegister> dests = builderRegisters(dst, "dst");
+        std::vector<StinkyRegister> srcs = builderRegisters(src, "src");
+        std::optional<std::string> branchTarget;
+        if (hasLabelField(*desc)) {
+            if (target.is_none())
+                fail(0, "branch instruction '" + mnemonic + "' requires 'target'");
+            if (!srcs.empty())
+                fail(0, "branch instruction '" + mnemonic + "' takes 'target', not src operands");
+            if (!PyUnicode_Check(target.ptr())) fail(0, "'target' must be a string");
+            branchTarget = nb::cast<std::string>(target);
+            if (!isLabelName(*branchTarget)) fail(0, "'target' is not a valid label name");
+            srcs.emplace_back(*branchTarget);
+        } else if (!target.is_none()) {
+            fail(0, "'target' is only valid for an instruction with a label operand");
+        }
+        validateOperandCounts(*desc, dests.size(), srcs.size(), promoted, 0);
+        validateOperands(*desc, dests, srcs, *archInfo_, arch_, promoted, 0);
+        const std::vector<StinkyRegister> implicitSrcs = implicitSources(implicitSrc);
+        // On a form with fewer sources than source fields (the two-source tensor_load_to_lds
+        // form), the verifier and every pass would read an appended register as the next
+        // field's operand.
+        if (const size_t fields = sourceFieldCount(*desc, promoted);
+            !implicitSrcs.empty() && srcs.size() < fields)
+            fail(0, "implicit_src is not accepted for '" + mnemonic + "' with " +
+                        std::to_string(srcs.size()) + " of its " + std::to_string(fields) +
+                        " source operands");
+        if (comment.find_first_of(std::string_view("\r\n\0", 3)) != std::string::npos)
+            fail(0, "'comment' must be a single line without NUL bytes");
+        if (!modifiers.is_none() && !PyDict_Check(modifiers.ptr()))
+            fail(0, "'modifiers' must be a dict or None");
+
+        StinkyInstruction* inst = builder_->create(promoted ? promotedDescriptor(*desc) : desc);
+        try {
+            inst->setDestRegs(dests);
+            inst->setSrcRegs(srcs);
+            addModifiers(*inst, modifiers.is_none() ? nb::handle() : nb::handle(modifiers), 0);
+            if (!comment.empty()) inst->addModifier(CommentData{comment});
+            const size_t explicitSrcCount = inst->getSrcRegs().size();
+            if (legalize) {
+                // The operand steps of the rocisa conversion's legalizeInstruction, in its
+                // order: SCC/VCC/EXEC accesses the descriptor declares, then the hidden source
+                // of each read-write destination (after the modifiers, since op_sel makes a
+                // narrow destination read-write). No instruction is split or rewritten.
+                legalizeImplicitSpecialRegisters(inst, archInfo_->waveFrontSize);
+                legalizeReadWriteSources(inst);
+            }
+            bool appendedImplicit = false;
+            for (const StinkyRegister& reg : implicitSrcs) {
+                const auto& present = inst->getSrcRegs();
+                if (std::find(present.begin(), present.end(), reg) != present.end()) continue;
+                inst->addSrcReg(reg);
+                appendedImplicit = true;
+            }
+            // Without the count, the emitter would print the appended registers as operands of
+            // an instruction whose descriptor has no operand fields (s_wait_idle, s_endpgm).
+            if (appendedImplicit) inst->addModifier(ExplicitSrcCountData(explicitSrcCount));
+        } catch (...) {
+            inst->erase();
+            throw;
+        }
+        if (branchTarget) branchTargets_.emplace_back(*branchTarget, count_);
+        allLegalized_ = allLegalized_ && legalize;
+        requiresM0WidthBypass_ = requiresM0WidthBypass_ ||
+                                 std::any_of(dests.begin(), dests.end(), isM0) ||
+                                 std::any_of(srcs.begin(), srcs.end(), isM0);
+        ++instructions_;
+        ++count_;
+    }
+
+    void label(const std::string& name, int64_t alignment) {
+        AsmBuilderMethodScope scope("label");
+        checkOpen();
+        if (!isLabelName(name)) fail(0, "'" + name + "' is not a valid label name");
+        if (alignment < 1 || alignment > std::numeric_limits<uint16_t>::max() ||
+            (alignment & (alignment - 1)) != 0)
+            fail(0, "label alignment must be a power of two in [1, 65535]");
+        if (labels_.contains(name)) fail(0, "duplicate label '" + name + "'");
+        builder_->createLabel(name, static_cast<uint16_t>(alignment));
+        labels_.insert(name);
+        ++count_;
+    }
+
+    void comment(const std::string& text) {
+        AsmBuilderMethodScope scope("comment");
+        checkOpen();
+        std::string value = validateStandaloneComment(text, 0);
+        AsmDirective* directive = builder_->createIR<AsmDirective>();
+        directive->kind = AsmDirectiveKind::TEXTBLOCK;
+        directive->value = std::move(value);
+        ++count_;
+    }
+
+    void blank() {
+        AsmBuilderMethodScope scope("blank");
+        checkOpen();
+        AsmDirective* directive = builder_->createIR<AsmDirective>();
+        directive->kind = AsmDirectiveKind::TEXTBLOCK;
+        directive->value = "\n";
+        ++count_;
+    }
+
+    nb::dict setGroupRange(const std::string& group, const std::string& firstLabel,
+                           const std::string& endLabel, bool endInclusive) {
+        AsmBuilderMethodScope scope("set_group_range");
+        if (!module_->hasGroup(group)) fail(0, "the pipeline registered no group '" + group + "'");
+        // Looked up now rather than kept from label(): the pipeline moves labels out of the
+        // entry block and can delete them, so a kept pointer could dangle.
+        BasicBlock& entry = *module_->getFunction().getEntryBlock();
+        auto entryLabel = [&](const std::string& name) {
+            StinkyInstruction* node = findLabel(entry, name);
+            if (node == nullptr)
+                fail(0, "label '" + name + "' is not in the entry block (" +
+                            (labels_.contains(name) ? "runOptimizationPipeline() already ran"
+                                                    : "no such label was built") +
+                            ")");
+            return node;
+        };
+        StinkyInstruction* first = entryLabel(firstLabel);
+        StinkyInstruction* endNode = entryLabel(endLabel);
+        // Walk forward from first to end_label: end_label must come after first_label.
+        IRBase* last = nullptr;
+        for (IRBase* node = first; node != endNode; node = node->getNext()) {
+            if (node == nullptr) fail(0, "end_label does not follow first_label");
+            if (dyn_cast<StinkyInstruction>(node)) last = node;
+        }
+        if (endInclusive) last = endNode;
+        // last is null when first_label is end_label and end_inclusive is false.
+        size_t nodes = 0, instructions = 0, labels = 0, directives = 0;
+        if (last != nullptr) {
+            for (IRBase* node = first;; node = node->getNext()) {
+                ++nodes;
+                if (auto* inst = dyn_cast<StinkyInstruction>(node)) {
+                    if (isLabel(*inst))
+                        ++labels;
+                    else
+                        ++instructions;
+                } else {
+                    ++directives;
+                }
+                if (node == last) break;
+            }
+        }
+        // Checked before the range is stored, so a rejected call changes nothing.
+        if (instructions == 0) fail(0, "the range holds no instruction besides labels");
+        module_->setGroupRange(group, IntrusiveListIterator<IRBase>(first),
+                               IntrusiveListIterator<IRBase>(last));
+        auto* lastInst = cast<StinkyInstruction>(last);
+        nb::dict info;
+        info["group"] = group;
+        info["first"] = firstLabel;
+        info["last_mnemonic"] = std::string(lastInst->getHwInstDesc()->mnemonic);
+        if (const auto* data = lastInst->getModifier<LabelData>()) info["last_label"] = data->label;
+        info["nodes"] = nodes;
+        info["instructions"] = instructions;
+        info["labels"] = labels;
+        info["directives"] = directives;
+        return info;
+    }
+
+    std::shared_ptr<StinkyAsmModule> finish() {
+        AsmBuilderMethodScope scope("finish");
+        checkOpen();
+        for (const auto& [target, node] : branchTargets_)
+            if (!labels_.contains(target))
+                fail(0, "undefined branch target '" + target + "' (branch at node " +
+                            std::to_string(node) + ")");
+        if (instructions_ > 0) {
+            // As emit_asm verifies its records. Read-write sources are checked only when every
+            // instruction was legalized, since legalize adds them.
+            AsmVerifierConfig config;
+            config.abortOnError = false;
+            config.checkRegisterWidths = !requiresM0WidthBypass_;
+            config.checkRegisterRanges = false;
+            config.checkReadWriteOperands = allLegalized_;
+            const std::string error = validateStinkyIR(module_->getFunction(), config);
+            if (!error.empty()) fail(0, "assembly IR validation failed: " + error);
+        }
+        finished_ = true;
+        return module_;
+    }
+
+   private:
+    const HwInstDesc* lookup(const std::string& mnemonic) const {
+        const auto& mnemonicMap = archInfo_->getMnemonicToIsaOpcodeMap();
+        auto opcodeIt = mnemonicMap.find(mnemonic);
+        if (opcodeIt == mnemonicMap.end())
+            fail(0, "unknown instruction '" + mnemonic + "' for " + archName_);
+        const HwInstDesc* desc = getMCIDByIsaOp(opcodeIt->second, arch_);
+        if (!desc || !desc->mnemonic)
+            fail(0, "instruction '" + mnemonic + "' has no hardware descriptor");
+        return desc;
+    }
+
+    /// implicit_src: physical SGPR or VGPR ranges the target has, without flags.
+    std::vector<StinkyRegister> implicitSources(const nb::list& values) const {
+        std::vector<StinkyRegister> regs = builderRegisters(values, "implicit_src");
+        for (size_t i = 0; i < regs.size(); ++i) {
+            const StinkyRegister& reg = regs[i];
+            const std::string where = "implicit_src[" + std::to_string(i) + "]";
+            if (reg.dataType != StinkyRegister::Type::Register ||
+                (reg.reg.type != RegType::S && reg.reg.type != RegType::V))
+                fail(0, where + " must be an SGPR or VGPR register");
+            if (reg.reg.isMinus || reg.reg.isAbs)
+                fail(0, where + " cannot carry negate/absolute flags");
+            validateRegisterRange(reg, *archInfo_, where, 0);
+        }
+        return regs;
+    }
+
+    void checkOpen() const {
+        if (finished_) fail(0, "finish() was already called");
+    }
+
+    const ArchHelper::ArchInfo* archInfo_ = nullptr;
+    GfxArchID arch_{};
+    std::string archName_;
+    std::shared_ptr<StinkyAsmModule> module_;
+    std::unique_ptr<AsmIRBuilder> builder_;
+    std::unordered_set<std::string> labels_;
+    std::vector<std::pair<std::string, size_t>> branchTargets_;  // target, node index
+    size_t count_ = 0;                                           // nodes built
+    size_t instructions_ = 0;
+    bool allLegalized_ = true;
+    bool requiresM0WidthBypass_ = false;
+    bool finished_ = false;
+};
+
 }  // namespace
 
 // Called from python_bindings.cpp, which declares it, so it cannot have internal linkage.
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 void init_asm_bridge(nb::module_& m) {
+    nb::class_<AsmBuilder>(
+        m, "AsmBuilder",
+        R"doc(Build a StinkyTofu Asm IR module node by node for runOptimizationPipeline().
+
+emit_asm prints already-selected records as text and runs no optimization pass. AsmBuilder
+instead builds a StinkyAsmModule that StinkyTofu's pipeline can schedule and rewrite. Each call
+checks its arguments against the target's instruction descriptor and either builds one node or
+raises ValueError and builds nothing.
+
+AsmBuilder does not select forms or encodings (the caller names the descriptor mnemonic and asks
+for the promoted encoding explicitly), allocate registers, insert VGPR-MSB state (the pipeline
+does), or split or rewrite instructions. Unlike emit_asm it has no allowlist: every mnemonic in
+the target's table is accepted, except on gfx1250 the forms the assembler rejects (ds_load_b192,
+ds_store_b192, ds_store_b256, s_waitcnt, s_barrier). VGPR numbers are full numbers (v300, not
+v44 under an s_set_vgpr_msb).
+)doc")
+        .def(nb::init<const std::string&, const std::string&, const nb::object&>(), nb::arg("arch"),
+             nb::arg("name"), nb::arg("options") = nb::none(),
+             R"doc(Start an empty module.
+
+Args:
+    arch: target name, e.g. "gfx1250". The module takes the target's architecture triple and
+        instruction groups (the group names its optimization pipeline registers).
+    name: module (kernel) name.
+    options: ModuleOptions as a dict keyed by field name (OptLevel, RegisterAllocation,
+        KeepAuthored, ...), or None.
+
+Raises:
+    ValueError: an unknown architecture or one with no registered optimization pipeline; an
+        options key that is not a ModuleOptions field, or a value of another type (bool and int
+        are not interchangeable); ArchName or wavefrontSize disagreeing with arch (ArchName
+        must be a target name that denotes arch's target; a feature suffix such as ":xnack-"
+        is not part of one); a KeepAuthored token other than nop, mov and reuse.
+)doc")
+        .def("read_write_dests", &AsmBuilder::readWriteDests, nb::arg("mnemonic"),
+             nb::arg("promoted") = false,
+             R"doc(Destination positions the descriptor of mnemonic marks read-write.
+
+Positions count the destinations only, from 0. With promoted=True the promoted encoding's
+descriptor is read. Taken from the descriptor alone: a narrow destination that an
+instruction's op_sel makes read-write is not included. Nothing is built.
+
+Raises:
+    ValueError: an unknown mnemonic, or promoted=True for one without a promoted encoding.
+)doc")
+        .def("instruction", &AsmBuilder::instruction, nb::arg("mnemonic"), nb::arg("dst"),
+             nb::arg("src"), nb::kw_only(), nb::arg("promoted") = false,
+             nb::arg("implicit_src") = nb::list(), nb::arg("modifiers") = nb::none(),
+             nb::arg("target") = nb::none(), nb::arg("comment") = "", nb::arg("legalize") = true,
+             R"doc(Append one instruction.
+
+Args:
+    mnemonic: descriptor mnemonic from the target's table.
+    dst, src: Register operands in descriptor order, as emit_asm takes them (including the
+        two-source tensor_load_to_lds / tensor_store_from_lds form). A VGPR is named by its
+        full number, and Register.offset must be 0.
+    promoted: build the promoted encoding (VOP3, printed with _e64) instead of the primary one.
+    implicit_src: SGPR or VGPR registers the instruction is taken to read, for dependency
+        tracking only, for example scalar-load destinations that must stay reserved until a
+        wait. Appended after the other sources unless already among them; never printed.
+        Not accepted with fewer src operands than the descriptor has source fields (the
+        two-source tensor_load_to_lds form), where the passes would read them as operands.
+    modifiers: the dict emit_asm accepts as a record's 'modifiers', or None.
+    target: label name; required by, and only valid for, an instruction with a label operand.
+        The label may be appended later.
+    comment: single-line text printed after the instruction.
+    legalize: add the sources StinkyTofu's passes expect: the SCC/VCC/EXEC accesses the
+        descriptor declares, and the hidden source of each read-write destination. With
+        legalize=False the instruction is built as given, and finish() then skips the
+        read-write source check for the whole module.
+
+Raises:
+    ValueError: an unknown mnemonic or a form the assembler rejects; promoted=True without a
+        promoted encoding; operands that do not fit the descriptor; a bad implicit_src entry,
+        modifier, target or comment; any call after finish(). Nothing is built.
+)doc")
+        .def("label", &AsmBuilder::label, nb::arg("name"), nb::arg("alignment") = 1,
+             R"doc(Append the label name, after `.align alignment` when alignment is above 1.
+
+Raises:
+    ValueError: an invalid or duplicate name, an alignment that is not a power of two in
+        [1, 65535], or a call after finish(). Nothing is built.
+)doc")
+        .def("comment", &AsmBuilder::comment, nb::arg("text"),
+             R"doc(Append a standalone comment line `// text`.
+
+Raises:
+    ValueError: text spans lines or holds a NUL byte, or a call after finish().
+)doc")
+        .def("blank", &AsmBuilder::blank, R"doc(Append an empty line.
+
+Raises:
+    ValueError: a call after finish().
+)doc")
+        .def("set_group_range", &AsmBuilder::setGroupRange, nb::arg("group"),
+             nb::arg("first_label"), nb::arg("end_label"), nb::arg("end_inclusive") = false,
+             R"doc(Give an instruction group a range of the module, by label.
+
+The range starts at the label first_label and ends at the last instruction or label before the
+label end_label; comment and blank nodes directly before end_label stay outside (a label's
+alignment belongs to the label). With end_inclusive=True it ends at end_label itself. Only the
+range is stored (StinkyAsmModule::setGroupRange); nothing is built or moved.
+
+Allowed before or after finish(), but call it before runOptimizationPipeline(): the pipeline
+moves labels out of the entry block, where they are looked up when this is called.
+
+Args:
+    group: an instruction group the target's pipeline registers, e.g. "loopWithPrefetch".
+
+Returns:
+    dict with group, first, last_mnemonic, last_label (when the range ends at a label) and the
+    counts nodes, instructions, labels and directives the range holds.
+
+Raises:
+    ValueError: an unregistered group; a label not in the entry block; end_label not after
+        first_label; a range that holds no instruction besides labels. Nothing is stored.
+)doc")
+        .def("finish", &AsmBuilder::finish,
+             R"doc(Check the module, close the builder and return the StinkyAsmModule.
+
+Every branch target must be a label of the module, and the instructions must pass the Asm IR
+verifier (validateStinkyIR: register types and widths against the descriptor, and read-write
+sources when every instruction was legalized). Afterwards every call that builds raises; the
+module stays valid after the builder is gone.
+
+Raises:
+    ValueError: an undefined branch target or a verifier error (the builder then stays open), or
+        a second call.
+)doc");
     m.def("emit_asm", &emitAsm, nb::arg("arch"), nb::arg("wave_size"), nb::arg("items"),
           R"doc(Emit ordered, already-selected assembly records through temporary Asm IR.
 

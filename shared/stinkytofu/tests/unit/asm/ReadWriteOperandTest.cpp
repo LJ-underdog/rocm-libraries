@@ -161,6 +161,42 @@ TEST_F(ReadWriteOperandTest, SCMovB64_MissingDstInSrc) {
 }
 
 // ---------------------------------------------------------------------------
+// s_addk_co_i32, s_bitset0_b32, s_bitset1_b32  —  D0 is RW: the instruction
+// adds an immediate to, or clears / sets one bit of, the register it writes.
+// HW fields: {D0, sdst, sdst, 32, RW}, {S0, simm16, simm16 | simm5, 16 | 5}
+// ---------------------------------------------------------------------------
+
+TEST_F(ReadWriteOperandTest, SAddkCoI32_Valid) {
+    std::string error = verifyRW("s_addk_co_i32", {sgpr(5)}, {StinkyRegister(1), sgpr(5)});
+    EXPECT_TRUE(error.empty()) << error;
+}
+
+TEST_F(ReadWriteOperandTest, SAddkCoI32_MissingDstInSrc) {
+    std::string error = verifyRW("s_addk_co_i32", {sgpr(5)}, {StinkyRegister(1)});
+    EXPECT_NE(error.find("Read-write"), std::string::npos) << "Expected RW error, got: " << error;
+}
+
+TEST_F(ReadWriteOperandTest, SBitset0B32_Valid) {
+    std::string error = verifyRW("s_bitset0_b32", {sgpr(5)}, {StinkyRegister(20), sgpr(5)});
+    EXPECT_TRUE(error.empty()) << error;
+}
+
+TEST_F(ReadWriteOperandTest, SBitset0B32_MissingDstInSrc) {
+    std::string error = verifyRW("s_bitset0_b32", {sgpr(5)}, {StinkyRegister(20)});
+    EXPECT_NE(error.find("Read-write"), std::string::npos) << "Expected RW error, got: " << error;
+}
+
+TEST_F(ReadWriteOperandTest, SBitset1B32_Valid) {
+    std::string error = verifyRW("s_bitset1_b32", {sgpr(5)}, {StinkyRegister(20), sgpr(5)});
+    EXPECT_TRUE(error.empty()) << error;
+}
+
+TEST_F(ReadWriteOperandTest, SBitset1B32_MissingDstInSrc) {
+    std::string error = verifyRW("s_bitset1_b32", {sgpr(5)}, {StinkyRegister(20)});
+    EXPECT_NE(error.find("Read-write"), std::string::npos) << "Expected RW error, got: " << error;
+}
+
+// ---------------------------------------------------------------------------
 // v_fmac_f32  —  D0 is RW: dst = src0 * src1 + dst
 // HW fields: {D0, vdst, vgpr, 32, RW}, {S0, src0, src, 32}, {S1, vsrc1, vgpr, 32}
 // ---------------------------------------------------------------------------

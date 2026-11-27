@@ -517,6 +517,12 @@ bool serializeVisit(const LabelData& mod, std::ostream& os) {
     return true;
 }
 
+// ExplicitSrcCountData
+bool serializeVisit(const ExplicitSrcCountData& mod, std::ostream& os) {
+    os << ", mod.explicit_src_count = { count = " << mod.count << " }";
+    return true;
+}
+
 // CallTargetData
 bool serializeVisit(const CallTargetData& mod, std::ostream& os) {
     os << ", mod.call_targets = { callees = " << stringVectorToBracketForm(mod.callees) << " }";
@@ -538,7 +544,7 @@ bool ModifierSerializer::serialize(const Modifier& mod, std::ostream& os) {
                           DPPModifiers, VOP3Modifiers, VOP3PModifiers, True16Modifiers, EXEC, VCC,
                           SWaitCntData, SWaitTensorCntData, SWaitAsyncCntData, SWaitStoreCntData,
                           SDelayAluData, SWaitAluData, MFMAModifiers, MatrixFmtModifiers,
-                          MemTokenData, LabelData, CallTargetData>(mod, os);
+                          MemTokenData, LabelData, CallTargetData, ExplicitSrcCountData>(mod, os);
 }
 
 /*
@@ -699,6 +705,10 @@ void deserializeVisit(StinkyInstruction* inst, const std::string& attrKey,
                                     static_cast<uint16_t>(getInt(fields, "alignment", 1))));
     } else if (attrKey == "mod.call_targets") {
         inst->addModifier(CallTargetData(getStrVector(fields, "callees")));
+    } else if (attrKey == "mod.explicit_src_count") {
+        if (fields.contains("count"))
+            inst->addModifier(
+                ExplicitSrcCountData(static_cast<size_t>(getInt(fields, "count", 0))));
     }
     // mod.sdwa, mod.true16: no deserialize support yet
 }

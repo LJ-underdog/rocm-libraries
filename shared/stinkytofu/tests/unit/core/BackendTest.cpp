@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <string>
 
 #include "stinkytofu/bindings/python/Module.hpp"
 #include "stinkytofu/pipeline/Backend.hpp"
@@ -54,6 +55,12 @@ std::unique_ptr<StinkyAsmModule> makeUnconfiguredModule(int optLevel = 3) {
     StinkyAsmModule::ModuleOptions opts{};
     opts.OptLevel = optLevel;
     return std::make_unique<StinkyAsmModule>("test", kArch, opts);
+}
+
+StinkyAsmModule::ModuleOptions keepAuthoredOptions(const std::string& list) {
+    StinkyAsmModule::ModuleOptions opts{};
+    opts.KeepAuthored = list;
+    return opts;
 }
 
 }  // namespace
@@ -170,6 +177,65 @@ TEST(BackendTest, UnconfiguredModuleIsAllowedAtO0) {
 
 TEST(BackendTest, ConfiguredModuleRunsOptimization) {
     auto module = makeModule();
+    Backend backend(*module);
+    EXPECT_TRUE(backend.runOptimization());
+}
+
+// ---------------------------------------------------------------------------
+// KeepAuthored (Module.hpp): the parts of the producer's code the gfx1250
+// pipeline leaves as written. AsmBuilder and stinkytofu-opt report a bad token
+// before the pipeline is built. The pipeline itself stops on one, for example
+// on a token set through lower_logical_module's options.
+// ---------------------------------------------------------------------------
+
+TEST(KeepAuthoredTest, EmptyListKeepsNothing) {
+    for (const char* list : {"", " ", ",", " ,\t,"}) {
+        const auto parts = keepAuthoredOptions(list).keepAuthored();
+        ASSERT_TRUE(parts.hasValue()) << "'" << list << "': " << parts.getError();
+        EXPECT_FALSE(parts->nop || parts->mov || parts->reuse) << "'" << list << "'";
+    }
+}
+
+TEST(KeepAuthoredTest, ParsesTokensIgnoringSpacesAndRepeats) {
+    const auto some = keepAuthoredOptions(" nop ,\treuse,").keepAuthored();
+    ASSERT_TRUE(some.hasValue()) << some.getError();
+    EXPECT_TRUE(some->nop);
+    EXPECT_FALSE(some->mov);
+    EXPECT_TRUE(some->reuse);
+
+    const auto all = keepAuthoredOptions("mov,nop,reuse,mov").keepAuthored();
+    ASSERT_TRUE(all.hasValue()) << all.getError();
+    EXPECT_TRUE(all->nop && all->mov && all->reuse);
+}
+
+TEST(KeepAuthoredTest, RejectsUnknownTokens) {
+    // Matched exactly: another case or a misspelling is an error rather than a no-op.
+    for (const char* token : {"NOP", "Mov", "nops", "nop mov"}) {
+        const auto parts = keepAuthoredOptions(std::string("reuse,") + token).keepAuthored();
+        ASSERT_TRUE(parts.hasError()) << token;
+        EXPECT_EQ(parts.getError(), std::string("KeepAuthored: unknown token '") + token +
+                                        "' (known tokens: nop, mov, reuse)");
+    }
+}
+
+TEST(KeepAuthoredDeathTest, UnknownTokenStopsThePipeline) {
+    EXPECT_DEATH(
+        {
+            auto module = makeModule();
+            StinkyAsmModule::ModuleOptions opts = module->getModuleOptions();
+            opts.KeepAuthored = "nop,MOV";
+            module->setModuleOptions(opts);
+            Backend backend(*module);
+            backend.runOptimization();
+        },
+        "KeepAuthored: unknown token 'MOV'");
+}
+
+TEST(BackendTest, KeepAuthoredModuleRunsOptimization) {
+    auto module = makeModule();
+    StinkyAsmModule::ModuleOptions opts = module->getModuleOptions();
+    opts.KeepAuthored = "nop,mov,reuse";
+    module->setModuleOptions(opts);
     Backend backend(*module);
     EXPECT_TRUE(backend.runOptimization());
 }

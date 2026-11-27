@@ -1,0 +1,19 @@
+# RUN: %stinkytofu-opt --arch gfx1250 %s --emit-asm
+#
+# mod.explicit_src_count (ExplicitSrcCountData) names how many leading sources are operands;
+# the sources after them only feed dependency tracking and are not printed. Without it, an
+# instruction with no operand fields prints every source, and the two-source tensor form
+# prints up to its descriptor's four source fields.
+#
+# CHECK: s_wait_idle{{$}}
+# CHECK-NEXT: tensor_load_to_lds s[8:11], s[12:19]{{$}}
+# CHECK-NEXT: s_wait_idle s[4:5]{{$}}
+# CHECK-NEXT: s_endpgm
+
+st.func @tracking_sources() {
+^entry:
+  "st.s_wait_idle"(s[4:5]) { issueCycles = 1, latencyCycles = 1, mod.explicit_src_count = { count = 0 } }
+  "st.tensor_load_to_lds"(s[8:11], s[12:19], s[40:43], s[44:47]) { issueCycles = 1, latencyCycles = 1, mod.explicit_src_count = { count = 2 } }
+  "st.s_wait_idle"(s[4:5]) { issueCycles = 1, latencyCycles = 1 }
+  "st.s_endpgm"() { issueCycles = 1, latencyCycles = 1 }
+}

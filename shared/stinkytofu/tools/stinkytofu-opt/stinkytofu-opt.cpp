@@ -217,8 +217,8 @@ std::vector<RequestedPass> parsePassNames(int argc, char** argv, int startIdx) {
                 arg == "--wait-alu-scoreboard" || arg.starts_with("--prefetch-lead-wmmas=") ||
                 arg.starts_with("--prefetch-lead-min-stage-wmmas=") ||
                 arg.starts_with("--war-gate-wmmas=") || arg == "--ds-slot-first" ||
-                arg.starts_with("--vgpr-msb-mode=") || arg == "--from-label" ||
-                arg == "--to-label" || isKernelConfigArg(arg))
+                arg.starts_with("--vgpr-msb-mode=") || arg.starts_with("--keep-authored=") ||
+                arg == "--from-label" || arg == "--to-label" || isKernelConfigArg(arg))
                 continue;
             // Two-arg flags: skip both the flag and its value so the value
             // doesn't get mistaken for a pass name and the flag doesn't get
@@ -353,6 +353,10 @@ int main(int argc, char** argv) {
         std::cerr << "                   guard against replay (Gfx1250XnackHazardPass, the SW\n";
         std::cerr << "                   instruction prefetch passes) emit no s_wait_xcnt drain.\n";
         std::cerr << "  -O<N>            Run the registered pipeline at opt level N (0-3)\n";
+        std::cerr << "  --keep-authored=<list>\n";
+        std::cerr << "                   With -O<N>: the pipeline leaves these parts of the\n";
+        std::cerr << "                   input as written: nop, mov, reuse (ModuleOptions\n";
+        std::cerr << "                   KeepAuthored)\n";
         std::cerr << "  --remarks        Enable optimization remarks on stderr\n";
         std::cerr << "  --verify-each    Verify StinkyTofu ASM IR after every pass\n";
         std::cerr << "  --dump-passes    Dump IR before/after each pass into before.txt and\n";
@@ -421,6 +425,10 @@ int main(int argc, char** argv) {
         std::cerr << "                   guard against replay (Gfx1250XnackHazardPass, the SW\n";
         std::cerr << "                   instruction prefetch passes) emit no s_wait_xcnt drain.\n";
         std::cerr << "  -O<N>            Run the registered pipeline at opt level N (0-3)\n";
+        std::cerr << "  --keep-authored=<list>\n";
+        std::cerr << "                   With -O<N>: the pipeline leaves these parts of the\n";
+        std::cerr << "                   input as written: nop, mov, reuse (ModuleOptions\n";
+        std::cerr << "                   KeepAuthored)\n";
         std::cerr << "  --remarks        Enable optimization remarks on stderr\n";
         std::cerr << "  --verify-each    Verify StinkyTofu ASM IR after every pass\n";
         std::cerr << "  --dump-passes    Dump IR before/after each pass into before.txt and\n";
@@ -707,6 +715,7 @@ int main(int argc, char** argv) {
     std::string outputFile;
     std::string fromLabel;
     std::string toLabel;
+    std::optional<std::string> keepAuthored;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--print-output") printOutput = true;
         if (std::string(argv[i]) == "--emit-asm") emitAsm = true;
@@ -724,6 +733,23 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "-o" && i + 1 < argc) outputFile = argv[++i];
         if (std::string(argv[i]) == "--from-label" && i + 1 < argc) fromLabel = argv[++i];
         if (std::string(argv[i]) == "--to-label" && i + 1 < argc) toLabel = argv[++i];
+        if (std::string(argv[i]).starts_with("--keep-authored="))
+            keepAuthored = std::string(argv[i]).substr(std::strlen("--keep-authored="));
+    }
+
+    // KeepAuthored gates passes of the registered pipeline, so it needs -O<N>, and a
+    // token the pipeline would reject is reported here instead of aborting it.
+    if (keepAuthored) {
+        if (optLevel < 0) {
+            std::cerr << "Error: --keep-authored applies to the -O<N> pipeline only\n";
+            return 1;
+        }
+        stinkytofu::StinkyAsmModule::ModuleOptions options{};
+        options.KeepAuthored = *keepAuthored;
+        if (auto parts = options.keepAuthored(); parts.hasError()) {
+            std::cerr << "Error: " << parts.getError() << "\n";
+            return 1;
+        }
     }
 
     // Auto-detect assembly input by file extension (.s)
@@ -922,6 +948,7 @@ int main(int argc, char** argv) {
             moduleOpts.EnableRemarks = enableRemarks;
             moduleOpts.VerifyEach = verifyEach;
             moduleOpts.TimePasses = timePasses;
+            moduleOpts.KeepAuthored = keepAuthored.value_or("");
             // The --Tile*/--NumGR*/--NumWaves flags are parsed for both modes but
             // used to be applied only in individual-pass mode, so pipeline mode
             // silently ran every kernel with a zeroed tile config. Backend's entry

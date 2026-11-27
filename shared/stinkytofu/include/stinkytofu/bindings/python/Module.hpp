@@ -34,6 +34,7 @@
 #include "stinkytofu/core/IRBase.hpp"
 #include "stinkytofu/pipeline/CloneSpec.hpp"
 #include "stinkytofu/pipeline/PassBuilder.hpp"
+#include "stinkytofu/support/ErrorHandling.hpp"
 
 /*
  * @brief Define the options for the ModuleOptions struct
@@ -67,6 +68,17 @@
  * @note TimePasses: print a per-pass wall-time report to stderr after the
  * pipeline runs (Tensile `StinkyTofuTimePasses`, stinkytofu-opt
  * `--time-passes`).
+ * @note KeepAuthored: parts of the producer's code the gfx1250 pipeline leaves
+ * as written, a comma-separated list of the tokens below; an empty list keeps
+ * nothing (stinkytofu-opt `--keep-authored=<list>`). Tokens are lower-case and
+ * matched exactly, spaces and tabs around a token are ignored, and an unknown
+ * token is an error (ModuleOptions::keepAuthored).
+ *   nop:   StinkyRemoveNopPass does not run, so no s_nop or v_nop is removed
+ *          (the scheduler can still move them).
+ *   mov:   AsmMovePropagationPass does not run.
+ *   reuse: SetMatrixReusePass does not run, so StinkyTofu adds no matrix-reuse
+ *          hints and keeps any the producer wrote; keeping those valid for the
+ *          final instruction order and registers is the producer's job.
  */
 #define MODULE_OPTIONS_LIST(X)                    \
     X(DebugLevel, int)                            \
@@ -117,6 +129,7 @@
     X(RegisterAllocationConfig, std::string)      \
     X(RegisterAllocationDump, bool)               \
     X(RemoveInstructions, std::string)            \
+    X(KeepAuthored, std::string)                  \
     X(CloneList, std::vector<CloneSpec>)          \
     X(DsReadQueueDepth, int)                      \
     X(DsReadDrainLatency, int)                    \
@@ -203,6 +216,17 @@ class STINKYTOFU_EXPORT StinkyAsmModule {
         /// mode applies and the configuration allocates scalars. A pass after
         /// allocation that found SGPRs by the producer's numbering asks this.
         bool sgprsCompacted() const;
+
+        /// The parts KeepAuthored names; each one true keeps that part as written.
+        struct KeepAuthoredParts {
+            bool nop = false;
+            bool mov = false;
+            bool reuse = false;
+        };
+
+        /// KeepAuthored parsed by the rule in its note above. The error names the
+        /// first unknown token.
+        Expected<KeepAuthoredParts> keepAuthored() const;
     };
 
     /**

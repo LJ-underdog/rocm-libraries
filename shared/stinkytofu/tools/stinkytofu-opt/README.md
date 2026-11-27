@@ -67,6 +67,10 @@ stinkytofu-opt [options] <ir_file> [--pass1] [--pass2] ...
 - `--tensor-load-wmma-space=<int>`: Scheduler tuning knob for tensor-load/WMMA spacing (`TensorLoadWmmaSpace`). `0` disables this adjustment; values `> 0` apply the CDNA5 barrier-threshold offset.
 - `--tensor-load-ds-load-gap-cycles=<int>`: Extra cycles between an after-barrier and the before-side ds_loads on gap placement (`TensorLoadDsLoadGapCycles`). Default `64`; `0` disables the extra gap.
 - `--time-passes`: Report per-pass wall time on stderr (self / total / runs, slowest first)
+- `--keep-authored=<list>`: With `-O<N>`, sets `ModuleOptions.KeepAuthored`: a comma-separated
+  list of `nop`, `mov` and `reuse` naming the parts of the input the gfx1250 pipeline leaves as
+  written (`nop`: StinkyRemoveNopPass does not run; `mov`: AsmMovePropagationPass does not run;
+  `reuse`: SetMatrixReusePass does not run). An unknown token is an error.
 - `--list-passes`: Display all available optimization passes
 - `--help`: Show usage information
 
